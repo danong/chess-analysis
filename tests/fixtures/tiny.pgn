@@ -1,0 +1,19 @@
+[Event "Synthetic environment fixture 1"]
+[Site "?"]
+[Date "2026.10.06"]
+[Round "1"]
+[White "FixtureWhite"]
+[Black "FixtureBlack"]
+[Result "1-0"]
+
+1. e4 e5 2. Qh5 Nc6 3. Bc4 Nf6 4. Qxf7# {Synthetic checkmate fixture.} 1-0
+
+[Event "Synthetic environment fixture 2"]
+[Site "?"]
+[Date "2026.10.06"]
+[Round "2"]
+[White "FixtureWhite"]
+[Black "FixtureBlack"]
+[Result "*"]
+
+1. d4 d5 2. c4 e6 3. Nc3 Nf6 *

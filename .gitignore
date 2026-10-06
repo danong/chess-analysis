@@ -1,0 +1,17 @@
+.venv/
+.tools/
+.cache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+data/
+reports/
+.env
+
+# Local streamed game archives, including archives placed at the repository root.
+*.pgn.zst

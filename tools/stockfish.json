@@ -1,0 +1,10 @@
+{
+  "version": "19",
+  "source_url": "https://github.com/official-stockfish/Stockfish/releases/download/sf_19/stockfish-linux-x86-64-universal.tar.gz",
+  "archive_sha256": "9defc0d4e55d49c65a6d042f3e571a39fcea499ade6dbe741b53b8c65e03611f",
+  "binary_sha256": "0f83d24cc46d2c66c60f16001af5444873bc112b7d028594513426894c12da19",
+  "binary_path": ".tools/stockfish/stockfish",
+  "threads_per_process": 1,
+  "hash_mib_per_process": 128,
+  "initial_workers": 4
+}
