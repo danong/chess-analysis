@@ -1,4 +1,4 @@
-"""Elementary relationship predicates; no ratings or engine outcomes are read."""
+"""Legacy symbolic relationship predicates, retained for historical comparison."""
 
 from collections import Counter
 from itertools import combinations_with_replacement

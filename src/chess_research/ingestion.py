@@ -2,21 +2,84 @@
 
 import hashlib
 import io
+import json
 import random
+import sys
 from collections import Counter
 from pathlib import Path
 
 import chess.pgn
 import zstandard
 
-from .records import DECISIONS, Decision, atomic_json, write_table
+from .records import DECISIONS, Decision, atomic_json, read_table, write_table
+
+PARTITIONS = ("discovery", "selection", "evaluation")
 
 
-def sample(archive: Path, run: Path, count: int, seed: int, fixture: bool = False) -> None:
+def _stratum_quotas(count: int, band_starts: list[int]) -> dict[int, dict[str, int]]:
+    """Allocate an exact sample target across bands and 60/20/20 player splits."""
+    if count < 1 or not band_starts:
+        raise ValueError("count and rating bands must be positive")
+    ordered_bands = sorted(band_starts)
+    band_quotas = {
+        band: count // len(ordered_bands) + (index < count % len(ordered_bands))
+        for index, band in enumerate(ordered_bands)
+    }
+    result: dict[int, dict[str, int]] = {}
+    weights = {"discovery": 60, "selection": 20, "evaluation": 20}
+    for band in ordered_bands:
+        quota = band_quotas[band]
+        allocated = {part: quota * weight // 100 for part, weight in weights.items()}
+        remainder = quota - sum(allocated.values())
+        order = sorted(
+            PARTITIONS,
+            key=lambda part: (-(quota * weights[part] % 100), PARTITIONS.index(part)),
+        )
+        for part in order[:remainder]:
+            allocated[part] += 1
+        result[band] = allocated
+    return result
+
+
+def sample(
+    archive: Path,
+    run: Path,
+    count: int,
+    seed: int,
+    fixture: bool = False,
+    rating_min: int = 400,
+    rating_max: int = 799,
+    stratified: bool = False,
+    prior_run: Path | None = None,
+) -> None:
+    if count < 1:
+        raise ValueError("count must be positive")
+    if rating_min < 0 or rating_max < 0:
+        raise ValueError("rating bounds must be nonnegative")
+    if rating_min > rating_max:
+        raise ValueError("rating_min must not exceed rating_max")
     if (run / "decisions.parquet").exists():
         raise ValueError("Use a fresh run directory for a new sample")
+    if prior_run is not None and not (prior_run / "decisions.parquet").is_file():
+        raise ValueError("prior_run must contain decisions.parquet")
     rng = random.Random(seed)
     counts: Counter[str] = Counter()
+    bands: Counter[int] = Counter()
+    partition_bands: Counter[tuple[int, str]] = Counter()
+    # Rating bands stay anchored to round 200 point boundaries even when a
+    # requested cohort starts or ends partway through a band.
+    band_starts = list(range(rating_min // 200 * 200, rating_max + 1, 200))
+    stratum_quotas = _stratum_quotas(count, band_starts)
+    quotas = {band: sum(values.values()) for band, values in stratum_quotas.items()}
+    prior_rows = read_table(prior_run / "decisions.parquet") if prior_run else []
+    prior_manifest_path = prior_run / "historical-exclusions.json" if prior_run else None
+    prior_manifest = (
+        json.loads(prior_manifest_path.read_text())
+        if prior_manifest_path is not None and prior_manifest_path.is_file()
+        else {}
+    )
+    prior_players = {r["player"] for r in prior_rows} | set(prior_manifest.get("players", []))
+    prior_positions = {r["position"] for r in prior_rows} | set(prior_manifest.get("positions", []))
     rows: list[Decision] = []
     scanned = 0
     with archive.open("rb") as raw:
@@ -26,6 +89,11 @@ def sample(archive: Path, run: Path, count: int, seed: int, fixture: bool = Fals
         with io.TextIOWrapper(stream, encoding="utf-8") as text:
             while len(rows) < count and (game := chess.pgn.read_game(text)) is not None:
                 scanned += 1
+                if scanned % 10_000 == 0:
+                    print(
+                        f"Scanned {scanned:,} games; sampled {len(rows):,}/{count:,} decisions",
+                        file=sys.stderr,
+                    )
                 h = game.headers
                 if game.errors or h.get("Variant", "Standard") != "Standard":
                     continue
@@ -48,7 +116,16 @@ def sample(archive: Path, run: Path, count: int, seed: int, fixture: bool = Fals
                         rating = 0
                     if move not in board.legal_moves:
                         raise ValueError("Illegal source replay")
-                    if 400 <= rating <= 799 and player != "?":
+                    position = " ".join(board.fen().split()[:4])
+                    split = partition(player, seed)
+                    if (
+                        rating_min <= rating <= rating_max
+                        and player != "?"
+                        and not (
+                            split == "evaluation"
+                            and (player in prior_players or position in prior_positions)
+                        )
+                    ):
                         game_id = h.get("Site", "?").rsplit("/", 1)[-1]
                         if game_id == "?" and not fixture:
                             raise ValueError("Missing source game ID")
@@ -64,15 +141,26 @@ def sample(archive: Path, run: Path, count: int, seed: int, fixture: bool = Fals
                                 "initial_fen": game.board().fen(),
                                 "history": history.copy(),
                                 "move": move.uci(),
-                                "position": " ".join(board.fen().split()[:4]),
+                                "position": position,
                             }
                         )
                     history.append(move.uci())
                     board.push(move)
                 rng.shuffle(candidates)
                 for row in candidates:
-                    if counts[row["player"]] < 10 and len(rows) < count:
+                    band = row["rating"] // 200 * 200
+                    split = partition(row["player"], seed)
+                    if (
+                        counts[row["player"]] < 10
+                        and len(rows) < count
+                        and (
+                            not stratified
+                            or partition_bands[(band, split)] < stratum_quotas[band][split]
+                        )
+                    ):
                         counts[row["player"]] += 1
+                        bands[band] += 1
+                        partition_bands[(band, split)] += 1
                         rows.append(row)
     if len({r["decision_id"] for r in rows}) != len(rows):
         raise ValueError("Duplicate source game IDs")
@@ -90,9 +178,43 @@ def sample(archive: Path, run: Path, count: int, seed: int, fixture: bool = Fals
             "scanned_games": scanned,
             "stopped_at_game_boundary": True,
             "fixture": fixture,
-            "cohort": [400, 799],
+            "cohort": [rating_min, rating_max],
+            "stratified": stratified,
+            "band_counts": {str(b): bands[b] for b in band_starts},
+            "band_quotas": {str(b): quotas[b] for b in band_starts} if stratified else None,
+            "partition_band_counts": {
+                str(b): {part: partition_bands[(b, part)] for part in PARTITIONS}
+                for b in band_starts
+            },
+            "partition_band_quotas": {str(b): stratum_quotas[b] for b in band_starts}
+            if stratified
+            else None,
+            "prefix_bias": (
+                "Seeded sample from the scanned archive prefix; archive order can affect inclusion."
+            ),
+            "prior_run": str(prior_run.resolve()) if prior_run else None,
+            "prior_manifest_sha256": hashlib.sha256(prior_manifest_path.read_bytes()).hexdigest()
+            if prior_manifest_path is not None and prior_manifest_path.is_file()
+            else None,
             "player_cap": 10,
-            "sampling": "seeded shuffled decisions per streamed game",
+            "sampling": "seeded shuffled decisions per streamed game"
+            if not stratified
+            else "seeded shuffled decisions per streamed game with per-band player-partition quotas",
+        },
+    )
+    atomic_json(
+        run / "historical-exclusions.json",
+        {
+            "players": sorted(prior_players),
+            "positions": sorted(prior_positions),
+            "source_decisions_sha256": hashlib.sha256(
+                (prior_run / "decisions.parquet").read_bytes()
+            ).hexdigest()
+            if prior_run
+            else None,
+            "source_manifest_sha256": hashlib.sha256(prior_manifest_path.read_bytes()).hexdigest()
+            if prior_manifest_path is not None and prior_manifest_path.is_file()
+            else None,
         },
     )
     atomic_json(run / "sample.complete.json", {"rows": len(rows)})

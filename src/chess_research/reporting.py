@@ -1,4 +1,4 @@
-"""Saved findings, deeper example analysis, and annotated PGN export."""
+"""Legacy symbolic findings, deeper example analysis, and annotated PGN export."""
 
 import asyncio
 import json

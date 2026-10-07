@@ -1,4 +1,4 @@
-"""Generate on discovery, select on selection, evaluate frozen rules once."""
+"""Legacy symbolic experiment; active discovery lives in trajectories.py."""
 
 import json
 from pathlib import Path
@@ -9,9 +9,9 @@ import pyarrow.parquet as pq
 from sklearn.ensemble import ExtraTreesRegressor
 
 from .analysis import load_analysis
-from .ingestion import partition
 from .records import atomic_json, read_table
 from .representation import describe_rule, feature_names
+from .splits import split_rows
 
 
 def extract_rules(
@@ -43,16 +43,6 @@ def extract_rules(
 
 def matches(rule: list, row: dict[str, Any]) -> bool:
     return all(row[n] > t if op == ">" else row[n] <= t for n, op, t in rule)
-
-
-def split_rows(rows: list[dict[str, Any]], seed: int) -> dict[str, list[dict[str, Any]]]:
-    groups: dict[str, list[dict[str, Any]]] = {}
-    seen: set[str] = set()
-    for part in ["discovery", "selection", "evaluation"]:
-        candidates = [r for r in rows if partition(r["player"], seed) == part]
-        groups[part] = [r for r in candidates if r["position"] not in seen]
-        seen.update(r["position"] for r in candidates)
-    return groups
 
 
 def evidence(rule: list, rows: list[dict[str, Any]], seed: int) -> dict[str, Any]:
