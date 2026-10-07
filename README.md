@@ -8,9 +8,63 @@ Run `uv run chess-research doctor` to check the environment. Run `uv run ruff ch
 
 Keep compressed archives and derived datasets in `data/`, and generated reports in `reports/`. Stream `.pgn.zst` files in bounded batches; retain selected games rather than expanding the monthly archive.
 
-## Active trajectory discovery proof
+## Active stable-error discovery proof
 
-The active experiment clusters deterministic differences between played and
+The current MVP finds recurring costly decisions by screening baseline analyses
+at 0.40 expected-score loss, then reanalysing candidates at one million nodes.
+It retains a decision only when the deeper loss remains above the threshold,
+before/after expected scores drift by at most 0.10, the preferred move differs
+from the played move, and the deeper PVs are legal. Deep scores must be exact;
+terminal positions may have no bound flag, and an empty after-PV is accepted
+only when the played move ends the game. The gate does not extend lines to rescue
+otherwise rejected decisions.
+
+The gate recomputes discovery, selection and evaluation assignments over every
+sampled decision, preserving the full denominators in `split-audit.json`.
+`stability.json` records every screened decision, both analyses, score drift and
+rejection reasons. Episode vectors are empty until descriptions are imported.
+The pipeline makes no model calls: export identity-free packets, author the
+descriptions externally, and import a JSON file with provider provenance,
+prompt metadata and one record per described decision (`decision_id`,
+`episode_sha256`, `raw_explanation`, `normalized`, and `grounded`; `reason` is
+optional). The normalized grounded descriptions from discovery alone fit the
+TF-IDF vocabulary and IDF weights. Selection and evaluation descriptions are
+transformed with that frozen model. TF-IDF vectors keep their L2-normalized
+geometry (no variance scaling); clustering is average linkage with cosine
+distance. TF-IDF is a lexical baseline, not a neural semantic embedding.
+The initial semantic pilot uses distance 0.6 without tuning on held-out results.
+Missing or ungrounded descriptions remain unclassified.
+
+```bash
+uv run --offline chess-research sample /path/to/archive.pgn.zst reports/stable-proof \
+  --count 6000 --seed 20261007 --rating-min 400 --rating-max 1199 --stratified
+uv run --offline chess-research analyse reports/stable-proof --nodes 100000
+uv run --offline chess-research stable-blunders reports/stable-proof \
+  --partition discovery --partition selection
+uv run --offline chess-research description-packets reports/stable-proof --partition discovery
+uv run --offline chess-research description-packets reports/stable-proof --partition selection
+# Review/describe the packet outside the pipeline, then import the returned JSON.
+uv run --offline chess-research import-descriptions reports/stable-proof \
+  reports/stable-proof/authored-descriptions.json
+uv run --offline chess-research cluster reports/stable-proof --max-episodes 1000 --distance 0.6
+uv run --offline chess-research review-packets reports/stable-proof --partition discovery
+uv run --offline chess-research review-packets reports/stable-proof --partition selection
+# Complete the emitted discovery review and selection audit; freeze their paths.
+uv run --offline chess-research freeze reports/stable-proof /path/to/review.json /path/to/selection-review.json
+```
+
+For a fresh evaluation run, sample with `--only-partition evaluation` and prior
+run exclusions, then run `stable-blunders RUN --partition evaluation`. To reuse
+the frozen semantic encoding, pass `--model-run` pointing to the discovery run
+when importing that evaluation run's descriptions. Candidate review and
+selection audits must finish before evaluation is opened; evaluation cannot
+revise discoveries. Reports include assignment coverage, context concentration,
+uncertainty and negative results. Rating associations do not establish learning,
+teachability or individual development.
+
+## Historical trajectory discovery proof
+
+The historical experiment clusters deterministic differences between played and
 engine-preferred continuations. It does not call an LLM, embed text, or detect
 named tactical skills. An assistant or human reviews discovery cluster packets
 outside the pipeline, and persists that review before candidates are measured.

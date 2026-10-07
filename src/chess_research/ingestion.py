@@ -16,10 +16,14 @@ from .records import DECISIONS, Decision, atomic_json, read_table, write_table
 PARTITIONS = ("discovery", "selection", "evaluation")
 
 
-def _stratum_quotas(count: int, band_starts: list[int]) -> dict[int, dict[str, int]]:
-    """Allocate an exact sample target across bands and 60/20/20 player splits."""
+def _stratum_quotas(
+    count: int, band_starts: list[int], only_partition: str | None = None
+) -> dict[int, dict[str, int]]:
+    """Allocate exact per-band counts across splits or to one requested split."""
     if count < 1 or not band_starts:
         raise ValueError("count and rating bands must be positive")
+    if only_partition is not None and only_partition not in PARTITIONS:
+        raise ValueError(f"only_partition must be one of {PARTITIONS}")
     ordered_bands = sorted(band_starts)
     band_quotas = {
         band: count // len(ordered_bands) + (index < count % len(ordered_bands))
@@ -29,6 +33,9 @@ def _stratum_quotas(count: int, band_starts: list[int]) -> dict[int, dict[str, i
     weights = {"discovery": 60, "selection": 20, "evaluation": 20}
     for band in ordered_bands:
         quota = band_quotas[band]
+        if only_partition is not None:
+            result[band] = {part: quota if part == only_partition else 0 for part in PARTITIONS}
+            continue
         allocated = {part: quota * weight // 100 for part, weight in weights.items()}
         remainder = quota - sum(allocated.values())
         order = sorted(
@@ -51,6 +58,7 @@ def sample(
     rating_max: int = 799,
     stratified: bool = False,
     prior_run: Path | None = None,
+    only_partition: str | None = None,
 ) -> None:
     if count < 1:
         raise ValueError("count must be positive")
@@ -58,6 +66,8 @@ def sample(
         raise ValueError("rating bounds must be nonnegative")
     if rating_min > rating_max:
         raise ValueError("rating_min must not exceed rating_max")
+    if only_partition is not None and only_partition not in PARTITIONS:
+        raise ValueError(f"only_partition must be one of {PARTITIONS}")
     if (run / "decisions.parquet").exists():
         raise ValueError("Use a fresh run directory for a new sample")
     if prior_run is not None and not (prior_run / "decisions.parquet").is_file():
@@ -69,7 +79,7 @@ def sample(
     # Rating bands stay anchored to round 200 point boundaries even when a
     # requested cohort starts or ends partway through a band.
     band_starts = list(range(rating_min // 200 * 200, rating_max + 1, 200))
-    stratum_quotas = _stratum_quotas(count, band_starts)
+    stratum_quotas = _stratum_quotas(count, band_starts, only_partition)
     quotas = {band: sum(values.values()) for band, values in stratum_quotas.items()}
     prior_rows = read_table(prior_run / "decisions.parquet") if prior_run else []
     prior_manifest_path = prior_run / "historical-exclusions.json" if prior_run else None
@@ -121,6 +131,7 @@ def sample(
                     if (
                         rating_min <= rating <= rating_max
                         and player != "?"
+                        and (only_partition is None or split == only_partition)
                         and not (
                             split == "evaluation"
                             and (player in prior_players or position in prior_positions)
@@ -180,6 +191,7 @@ def sample(
             "fixture": fixture,
             "cohort": [rating_min, rating_max],
             "stratified": stratified,
+            "only_partition": only_partition,
             "band_counts": {str(b): bands[b] for b in band_starts},
             "band_quotas": {str(b): quotas[b] for b in band_starts} if stratified else None,
             "partition_band_counts": {

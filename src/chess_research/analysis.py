@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,8 @@ import chess.engine
 
 from .doctor import ROOT
 from .records import ANALYSES, Analysis, atomic_json, read_table, write_table
+
+ANALYSIS_SCHEMA_VERSION = 2
 
 
 def replay(row: dict[str, Any]) -> chess.Board:
@@ -45,6 +48,7 @@ async def analyse(
         "expected_score_model": "python-chess sf WDL",
         "chess_version": chess.__version__,
         "batch_size": batch_size,
+        "analysis_schema_version": ANALYSIS_SCHEMA_VERSION,
     }
     key = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:16]
     target = run / f"analysis-{key}"
@@ -87,6 +91,14 @@ async def analyse(
                     )
                     bcp, bm, be = score_fields(before["score"].pov(color), row["ply"])
                     acp, am, ae = score_fields(after["score"].pov(color), row["ply"] + 1)
+
+                    def bound(info: Mapping[str, Any]) -> str:
+                        if info.get("lowerbound"):
+                            return "lower"
+                        if info.get("upperbound"):
+                            return "upper"
+                        return "exact"
+
                     results.append(
                         {
                             "decision_id": row["decision_id"],
@@ -99,6 +111,10 @@ async def analyse(
                             "loss": be - ae,
                             "before_pv": [m.uci() for m in before.get("pv", [])],
                             "after_pv": [m.uci() for m in after.get("pv", [])],
+                            "before_depth": before.get("depth"),
+                            "after_depth": after.get("depth"),
+                            "before_bound": bound(before),
+                            "after_bound": bound(after),
                         }
                     )
                 name = hashlib.sha256(

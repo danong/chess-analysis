@@ -27,5 +27,13 @@ def split_rows(
                 )
             )
         ]
+        if part == "evaluation":
+            unique = []
+            evaluation_positions: set[str] = set()
+            for row in groups[part]:
+                if row["position"] not in evaluation_positions:
+                    unique.append(row)
+                    evaluation_positions.add(row["position"])
+            groups[part] = unique
         seen.update(r["position"] for r in candidates)
     return groups

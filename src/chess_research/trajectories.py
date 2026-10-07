@@ -44,6 +44,39 @@ def active_clusters(run: Path) -> tuple[Path, dict[str, Any]]:
     return path, result
 
 
+def _validate_semantic_artifacts(run: Path) -> None:
+    """Require completion manifests to bind stable episodes and frozen text vectors."""
+    required = [
+        "episodes.parquet",
+        "episodes.config.json",
+        "episodes.complete.json",
+        "stability.json",
+        "descriptions.json",
+        "descriptions.complete.json",
+        "embedding-model.json",
+    ]
+    if any(not (run / name).is_file() for name in required):
+        raise ValueError("Complete stable semantic artifacts are required")
+    episode = load_json(run / "episodes.complete.json")
+    description = load_json(run / "descriptions.complete.json")
+    config = load_json(run / "episodes.config.json")
+    embedding = load_json(run / "embedding-model.json")
+    config_hash = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
+    checks = [
+        (episode.get("episodes_sha256"), digest(run / "episodes.parquet")),
+        (episode.get("stability_sha256"), digest(run / "stability.json")),
+        (episode.get("config_sha256"), config_hash),
+        (description.get("descriptions_sha256"), digest(run / "descriptions.json")),
+        (description.get("episodes_sha256"), digest(run / "episodes.parquet")),
+        (description.get("episodes_config_sha256"), digest(run / "episodes.config.json")),
+        (description.get("embedding_model_sha256"), digest(run / "embedding-model.json")),
+        (config.get("embedding_model_sha256"), digest(run / "embedding-model.json")),
+        (config.get("description_prompt_version"), embedding.get("prompt_version")),
+    ]
+    if any(actual != expected for actual, expected in checks):
+        raise ValueError("Stable semantic completion hash mismatch")
+
+
 def supported(group: dict[str, Any]) -> bool:
     return (
         group["support"] >= MIN_SUPPORT
@@ -92,6 +125,17 @@ def cluster(run: Path, max_episodes: int = 200, distance: float = 0.3) -> Path:
             "decisions.parquet",
         ]
     }
+    semantic = (run / "embedding-model.json").exists()
+    if semantic:
+        _validate_semantic_artifacts(run)
+        for filename in [
+            "embedding-model.json",
+            "descriptions.json",
+            "stability.json",
+            "episodes.complete.json",
+            "descriptions.complete.json",
+        ]:
+            inputs[filename] = digest(run / filename)
     spec = {
         "version": 1,
         "method": "average-linkage agglomerative, cosine distance",
@@ -105,6 +149,12 @@ def cluster(run: Path, max_episodes: int = 200, distance: float = 0.3) -> Path:
     if path.exists():
         atomic_json(run / "active-clusters.json", {"path": path.name})
         return path
+    description_authors = {}
+    if semantic:
+        description_authors = {
+            r["decision_id"]: r.get("author") or "unspecified"
+            for r in load_json(run / "descriptions.json")["records"]
+        }
     groups = []
     scaler_mean: list[float] = []
     scaler_scale: list[float] = []
@@ -113,9 +163,13 @@ def cluster(run: Path, max_episodes: int = 200, distance: float = 0.3) -> Path:
         x = np.array([r["vector"] for r in rows], dtype=float)
         # Scale units without subtracting the shared event signal: an identical
         # recurring trajectory must not become a zero vector after centering.
-        scaler = StandardScaler(with_mean=False).fit(x)
-        x = scaler.transform(x)
-        scaler_mean, scaler_scale = np.zeros(x.shape[1]).tolist(), scaler.scale_.tolist()
+        if semantic:
+            scaler_mean = np.zeros(x.shape[1]).tolist()
+            scaler_scale = np.ones(x.shape[1]).tolist()
+        else:
+            scaler = StandardScaler(with_mean=False).fit(x)
+            x = scaler.transform(x)
+            scaler_mean, scaler_scale = np.zeros(x.shape[1]).tolist(), scaler.scale_.tolist()
         nonzero = np.linalg.norm(x, axis=1) > 1e-12
         zero_ids = [r["decision_id"] for r, ok in zip(rows, nonzero, strict=True) if not ok]
         rows = [r for r, ok in zip(rows, nonzero, strict=True) if ok]
@@ -144,6 +198,19 @@ def cluster(run: Path, max_episodes: int = 200, distance: float = 0.3) -> Path:
                     "unique_players": len({r["player"] for r in group_rows}),
                     "unique_positions": len({r["position"] for r in group_rows}),
                     "unique_games": len({r["game_id"] for r in group_rows}),
+                    "description_author_counts": {
+                        author: sum(
+                            description_authors.get(r["decision_id"]) == author for r in group_rows
+                        )
+                        for author in sorted(
+                            {
+                                description_authors.get(r["decision_id"], "unspecified")
+                                for r in group_rows
+                            }
+                        )
+                    }
+                    if semantic
+                    else {},
                     "centroid": center.tolist(),
                     "radius": radius,
                     "mean_distance": float(distances.mean()),
@@ -160,7 +227,9 @@ def cluster(run: Path, max_episodes: int = 200, distance: float = 0.3) -> Path:
             for b in sorted({r["rating"] // 200 * 200 for r in rows})
         },
         "standardized_zero_ids": zero_ids,
-        "scaling": "discovery standard deviations, without centering",
+        "scaling": "identity for L2-normalized TF-IDF"
+        if semantic
+        else "discovery standard deviations, without centering",
         "scaler_mean": scaler_mean,
         "scaler_scale": scaler_scale,
         "clusters": groups,
@@ -278,6 +347,10 @@ def review_packets(run: Path, partition: str = "discovery") -> Path:
                     grouped.setdefault(assigned, []).append((row, assignment_distance))
                 else:
                     rejected += 1
+    descriptions = {}
+    if (run / "descriptions.json").exists():
+        payload = load_json(run / "descriptions.json")
+        descriptions = {r["decision_id"]: r for r in payload["records"]}
     packets, games = [], []
     for group in model["clusters"]:
         members = sorted(grouped.get(group["cluster_id"], []), key=lambda pair: pair[1])
@@ -314,6 +387,7 @@ def review_packets(run: Path, partition: str = "discovery") -> Path:
                     "decision_id": row["decision_id"],
                     "fen": board.fen(),
                     "human_san": human,
+                    "description": descriptions.get(row["decision_id"]),
                     "distance": d,
                     "variations": dict(alternatives),
                     "before_cp": row["before_cp"],
@@ -331,6 +405,7 @@ def review_packets(run: Path, partition: str = "discovery") -> Path:
                 "eligible_for_review_acceptance": supported(group),
                 "source_support": group["support"],
                 "source_players": group["unique_players"],
+                "description_author_counts": group.get("description_author_counts", {}),
                 "context": concentration([r for r, _ in members]),
                 "examples": examples,
             }
@@ -394,12 +469,12 @@ def review_packets(run: Path, partition: str = "discovery") -> Path:
             "",
             f"Support: {p['support']}; source players: {p['source_players']}; eligible: {p['eligible_for_review_acceptance']}.",
             "",
-            f"Context: {p['context']}",
+            f"Context: {p['context']}; description authors: {p['description_author_counts']}",
             "",
         ]
         for e in p["examples"]:
             lines += [
-                f"- `{e['decision_id']}`: **{e['human_san']}**; distance {e['distance']:.3f}; loss {e['loss']:.3f}. Played: {e['variations']['played']}. Preferred: {e['variations']['preferred']}. FEN: `{e['fen']}`."
+                f"- Description: {(e.get('description') or {}).get('raw_explanation', 'numeric trajectory')}. `{e['decision_id']}`: **{e['human_san']}**; distance {e['distance']:.3f}; loss {e['loss']:.3f}. Played: {e['variations']['played']}. Preferred: {e['variations']['preferred']}. FEN: `{e['fen']}`."
             ]
         lines.append("")
     (target / f"{partition}.md").write_text("\n".join(lines) + "\n")
@@ -608,6 +683,11 @@ def measure(run: Path, bootstrap: int = 1000, taxonomy_run: Path | None = None) 
             raise ValueError(f"Frozen input changed: {filename}")
     if digest(source / taxonomy["clusters_path"]) != taxonomy["clusters_sha256"]:
         raise ValueError("Frozen discovery artifact changed")
+    semantic = (source / "embedding-model.json").exists()
+    if semantic:
+        _validate_semantic_artifacts(source)
+        if source.resolve() != run.resolve():
+            _validate_semantic_artifacts(run)
     config = load_json(run / "config.json")
     ids = set(load_json(run / "partitions.json")["evaluation"])
     decisions = [r for r in read_table(run / "decisions.parquet") if r["decision_id"] in ids]
@@ -617,8 +697,16 @@ def measure(run: Path, bootstrap: int = 1000, taxonomy_run: Path | None = None) 
     if source.resolve() != run.resolve():
         source_config = load_json(source / "episodes.config.json")
         current_config = load_json(run / "episodes.config.json")
-        for key in ["feature_names", "horizon", "loss_threshold", "encoding"]:
-            if source_config[key] != current_config[key]:
+        for key in [
+            "feature_names",
+            "horizon",
+            "loss_threshold",
+            "encoding",
+            "stable_gate",
+            "embedding_model_sha256",
+            "description_prompt_version",
+        ]:
+            if source_config.get(key) != current_config.get(key):
                 raise ValueError(f"External evaluation encoding differs: {key}")
         original_engine = load_json(
             source / load_json(source / "active-analysis.json")["path"] / "config.json"
@@ -761,8 +849,24 @@ def measure(run: Path, bootstrap: int = 1000, taxonomy_run: Path | None = None) 
                 "qualifying_cost_ci": interval(boot_qualifying_cost[:, j]),
             }
         )
+    stability_summary = None
+    if (run / "stability.json").exists():
+        ledger = load_json(run / "stability.json")
+        screened = [r for r in ledger["decisions"] if r["decision_id"] in ids]
+        reasons: dict[str, int] = {}
+        for row in screened:
+            for reason in row["rejection_reasons"]:
+                reasons[reason] = reasons.get(reason, 0) + 1
+        stability_summary = {
+            "gate": ledger["config"]["stable_gate"],
+            "baseline_candidates": len(screened),
+            "confirmed": sum(r["stable"] for r in screened),
+            "rejections": reasons,
+            "ledger_sha256": digest(run / "stability.json"),
+        }
     result = {
         "version": 1,
+        "stability": stability_summary,
         "taxonomy_id": taxonomy["taxonomy_id"],
         "taxonomy_sha256": digest(source / "taxonomy.json"),
         "taxonomy_run": str(source.resolve()),
@@ -798,34 +902,63 @@ def write_report(
     partitions = load_json(run / "partitions.json")
     engine = load_json(run / load_json(run / "active-analysis.json")["path"] / "config.json")
     lines = [
-        "# Engine-trajectory discovery proof",
+        "# Stable-blunder semantic discovery proof"
+        if (source / "embedding-model.json").exists()
+        else "# Engine-trajectory discovery proof",
         "",
         f"Source: `{config['archive']}`; seed {config['seed']}; sampled {config['sampled']} decisions. {config['scanned_games']} prefix games scanned; player cap {config['player_cap']}.",
         "",
         f"Partitions: { {p: len(v) for p, v in partitions.items()} }. Historical exclusions: `{config.get('prior_run')}`. Moving-player splits, with earlier positions excluded from later partitions.",
         "",
-        f"Engine: `{engine}`. No model calls, text embeddings, named tactical detectors, or rating features.",
+        f"Engine: `{engine}`. No repository model calls, named tactical detectors, or rating features. External descriptions and discovery-only TF-IDF are used when recorded in the encoding.",
         "",
-        f"Discovery: {model['sampled']} episodes; rating strata {model['sample_band_counts']}; {len(model['clusters'])} clusters; {len(taxonomy['candidates'])} accepted families. {model['truncated']} qualifying episodes truncated and {model['uninformative']} uninformative before sampling.",
+        f"Discovery: {model['sampled']} episodes; rating strata {model['sample_band_counts']}; {len(model['clusters'])} clusters; {len(taxonomy['candidates'])} accepted families. {model['truncated']} qualifying episodes unavailable for encoding and {model['uninformative']} uninformative before sampling.",
         "",
         f"Encoding: {load_json(run / 'episodes.config.json')['encoding']}; {len(load_json(run / 'episodes.config.json')['feature_names'])} dimensions; horizon {load_json(run / 'episodes.config.json')['horizon']}; expected-score loss gate {load_json(run / 'episodes.config.json')['loss_threshold']}. [Full schema and provenance](episodes.config.json).",
         "",
-        f"Clustering: {model['method']}; threshold {model['distance']}; discovery-only standardization. Frozen taxonomy `{taxonomy['taxonomy_id']}`. Selection audits are purposive quality checks, not unbiased accuracy estimates.",
+        f"Clustering: {model['method']}; threshold {model['distance']}; scaling {model.get('scaling', 'discovery standard deviations, without centering')}. Frozen taxonomy `{taxonomy['taxonomy_id']}`. Selection audits are purposive quality checks, not unbiased accuracy estimates.",
         "",
         f"Discovery source: `{source.resolve()}`. Inspection: [discovery]({prefix}/inspection/{path.stem}/discovery.md), [selection]({prefix}/inspection/{path.stem}/selection.md), and paired PGNs in the same directory.",
         "",
         "## Holdout coverage",
         "",
-        "| Rating | Decisions | Players | Qualifying mistakes | Classified | Coverage | Truncated | Qualifying cost/100 decisions |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|",
+        "| Rating | Decisions | Players | Qualifying mistakes | Classified | Coverage | Unavailable descriptions/traces | Qualifying mistakes/100 decisions | 95% rate interval | Qualifying cost/100 decisions | 95% cost interval |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---|---:|---|",
     ]
+    if result.get("stability"):
+        gate = result["stability"]
+        lines[2:2] = [
+            f"Stable gate: `{gate['gate']}`. Baseline candidates {gate['baseline_candidates']}; confirmed {gate['confirmed']}; rejection reasons `{gate['rejections']}`.",
+            "",
+            "TF-IDF measures lexical similarity, not neural semantic similarity. Descriptions are externally authored, position-grounded, and rating blind. Undescribed or rejected errors remain unclassified. Rating differences are observational associations, not evidence of learning or teachability.",
+            "",
+        ]
+    if (source / "descriptions.json").exists():
+        source_descriptions = load_json(source / "descriptions.json")
+        evaluation_descriptions = load_json(run / "descriptions.json")
+        lines[2:2] = [
+            f"Description prompt: `{source_descriptions.get('prompt_version', 'unrecorded')}`; discovery/selection provider: {source_descriptions.get('provider', 'unrecorded')}. Evaluation provider: {evaluation_descriptions.get('provider', 'unrecorded')}. Generated descriptions and prompt hashes are retained in the linked JSON artifacts.",
+            "",
+        ]
     for b in result["coverage"]:
         value = b["assignment_coverage"]
         coverage = f"{100 * value:.1f}%" if value is not None else "NA"
         cost = b["qualifying_cost_per_100_decisions"]
         cost_text = f"{cost:.2f}" if cost is not None else "NA"
+        rate = b["qualifying_incidents_per_100_decisions"]
+        rate_text = f"{rate:.2f}" if rate is not None else "NA"
+        rate_ci = (
+            "–".join(f"{v:.2f}" for v in b["qualifying_rate_ci"])
+            if b["qualifying_rate_ci"]
+            else "NA"
+        )
+        cost_ci = (
+            "–".join(f"{v:.2f}" for v in b["qualifying_cost_ci"])
+            if b["qualifying_cost_ci"]
+            else "NA"
+        )
         lines.append(
-            f"| {b['band']} | {b['decisions']} | {b['players']} | {b['qualifying_mistakes']} | {b['classified']} | {coverage} | {b['truncated']} | {cost_text} |"
+            f"| {b['band']} | {b['decisions']} | {b['players']} | {b['qualifying_mistakes']} | {b['classified']} | {coverage} | {b['truncated']} | {rate_text} | {rate_ci} | {cost_text} | {cost_ci} |"
         )
     lines += [
         "",
@@ -861,7 +994,9 @@ def write_report(
         "",
         result["scope"] + ".",
         "",
-        "Expected-score gating saturates in already won/lost positions; search budget and PV length affect eligibility. Material/event trajectories can group consequences while missing decision mechanisms or quiet positional errors. Context checks use opening prefixes and material counts, not an authored skill taxonomy. Low assignment coverage limits family comparisons. No player-learning or teaching-effectiveness claim follows.",
+        "Expected-score gating uses Stockfish's WDL model, not measured low-rated player win probabilities, and saturates in already won/lost positions. Search budget and PV length affect eligibility; stability and explanation rejection can introduce nonrandom missingness. TF-IDF can fragment synonymous errors or group wording rather than mechanisms. Context checks use opening prefixes and material counts, not an authored skill taxonomy. Low assignment coverage limits family comparisons. No player-learning or teaching-effectiveness claim follows."
+        if (source / "embedding-model.json").exists()
+        else "Expected-score gating saturates in already won/lost positions; search budget and PV length affect eligibility. Material/event trajectories can group consequences while missing decision mechanisms or quiet positional errors. Context checks use opening prefixes and material counts, not an authored skill taxonomy. Low assignment coverage limits family comparisons. No player-learning or teaching-effectiveness claim follows.",
         "",
     ]
     sensitivity = source / "engine-audit.json"

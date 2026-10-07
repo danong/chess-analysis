@@ -11,6 +11,11 @@ from .doctor import doctor
 
 app = typer.Typer(no_args_is_help=True)
 app.command()(doctor)
+STABLE_PARTITIONS_OPTION = typer.Option(
+    ["discovery", "selection", "evaluation"],
+    "--partition",
+    help="Split partitions to process; repeat the option to select several.",
+)
 
 
 @app.command()
@@ -24,11 +29,14 @@ def sample(
     rating_max: int = 799,
     stratified: bool = False,
     prior_run: Path | None = None,
+    only_partition: str | None = None,
 ) -> None:
     if count < 1:
         raise typer.BadParameter("count must be positive")
     if rating_min < 0 or rating_max < 0 or rating_min > rating_max:
         raise typer.BadParameter("rating bounds must be nonnegative and rating_min <= rating_max")
+    if only_partition is not None and only_partition not in ingestion.PARTITIONS:
+        raise typer.BadParameter("only-partition must be discovery, selection, or evaluation")
     ingestion.sample(
         archive,
         run,
@@ -39,6 +47,7 @@ def sample(
         rating_max,
         stratified,
         prior_run,
+        only_partition,
     )
 
 
@@ -72,6 +81,32 @@ def episodes(run: Path, loss_threshold: float = 0.10, horizon: int = 6) -> None:
         raise typer.BadParameter("horizon must be positive")
     episode_stage = import_module(".episodes", __package__)
     typer.echo(episode_stage.build_episodes(run, loss_threshold, horizon))
+
+
+@app.command("stable-blunders")
+def stable_blunders(
+    run: Path,
+    min_loss: float = 0.4,
+    max_score_drift: float = 0.1,
+    deep_nodes: int = 1_000_000,
+    partitions: list[str] = STABLE_PARTITIONS_OPTION,
+) -> None:
+    stable = import_module(".stable", __package__)
+    typer.echo(
+        stable.stable_blunders(run, min_loss, max_score_drift, deep_nodes, tuple(partitions))
+    )
+
+
+@app.command("description-packets")
+def description_packets(run: Path, partition: str = "discovery") -> None:
+    semantics = import_module(".semantics", __package__)
+    typer.echo(semantics.description_packets(run, partition))
+
+
+@app.command("import-descriptions")
+def import_descriptions(run: Path, descriptions: Path, model_run: Path | None = None) -> None:
+    semantics = import_module(".semantics", __package__)
+    typer.echo(semantics.import_descriptions(run, descriptions, model_run))
 
 
 @app.command()

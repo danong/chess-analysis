@@ -465,6 +465,165 @@ def _write_freeze_fixture(run, *, enough_support=False):
     return Path(review), Path(selection), cluster_path
 
 
+def test_semantic_cluster_uses_identity_scaling_and_freeze_binds_embedding_model(tmp_path):
+    import hashlib
+    import json
+
+    from chess_research.records import atomic_json
+    from chess_research.trajectories import cluster, digest, freeze, review_packets
+
+    run = tmp_path / "semantic-run"
+    _write_freeze_fixture(run, enough_support=True)
+    model = {
+        "version": 1,
+        "method": "tfidf",
+        "vocabulary": {"captures": 0},
+        "idf_vector": [1.0],
+        "prompt_version": "stable-error-description-v1",
+        "dimension": 1,
+        "training_ids": ["disc-00"],
+    }
+    atomic_json(run / "embedding-model.json", model)
+    atomic_json(run / "descriptions.json", {"records": []})
+    atomic_json(
+        run / "stability.json",
+        {"config": {"stable_gate": {"version": 1}}, "screened": 30, "decisions": []},
+    )
+    config_path = run / "episodes.config.json"
+    config = json.loads(config_path.read_text()) | {
+        "encoding": "TF-IDF external stable-error descriptions",
+        "feature_names": ["captures"],
+        "embedding_model_sha256": digest(run / "embedding-model.json"),
+        "description_prompt_version": model["prompt_version"],
+        "stable_gate": {"version": 1},
+    }
+    atomic_json(config_path, config)
+    episodes_complete = {
+        "episodes_sha256": digest(run / "episodes.parquet"),
+        "stability_sha256": digest(run / "stability.json"),
+        "config_sha256": hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest(),
+    }
+    atomic_json(run / "episodes.complete.json", episodes_complete)
+    atomic_json(
+        run / "descriptions.complete.json",
+        {
+            "descriptions_sha256": digest(run / "descriptions.json"),
+            "episodes_sha256": digest(run / "episodes.parquet"),
+            "episodes_config_sha256": digest(config_path),
+            "embedding_model_sha256": digest(run / "embedding-model.json"),
+        },
+    )
+
+    cluster_path = cluster(run, max_episodes=100)
+    clustered = json.loads(cluster_path.read_text())
+    assert clustered["scaling"] == "identity for L2-normalized TF-IDF"
+    assert clustered["scaler_mean"] == [0.0]
+    assert clustered["scaler_scale"] == [1.0]
+    assert clustered["inputs"]["embedding-model.json"] == digest(run / "embedding-model.json")
+    assert "descriptions.complete.json" in clustered["inputs"]
+
+    packets = review_packets(run, "discovery")
+    review = json.loads((packets / "review.template.json").read_text())
+    review["reviewer"] = "synthetic-review"
+    for candidate in review["candidates"]:
+        candidate.update(
+            {
+                "accepted": False,
+                "coherent": False,
+                "name": "",
+                "supporting_episode_ids": [],
+                "reason": "Reviewed as a synthetic rejected family.",
+            }
+        )
+    review_path = run / "semantic-review.json"
+    atomic_json(review_path, review)
+
+    selection_packets = review_packets(run, "selection")
+    selection_path = selection_packets / "selection-review.template.json"
+    selection = json.loads(selection_path.read_text())
+    selection["reviewer"] = "synthetic-review"
+    for assignment in selection["assignments"]:
+        assignment.update({"correct": True, "reason": "Synthetic identity-vector assignment."})
+    atomic_json(selection_path, selection)
+
+    taxonomy = json.loads(freeze(run, review_path, selection_path).read_text())
+    assert taxonomy["inputs"]["embedding-model.json"] == digest(run / "embedding-model.json")
+
+    # A separate evaluation run must bind its own semantic episode vectors to
+    # the descriptions, model, and stable gate it was imported with.
+    evaluation = tmp_path / "semantic-evaluation"
+    _write_freeze_fixture(evaluation, enough_support=False)
+    from chess_research.episodes import EPISODES
+    from chess_research.records import DECISIONS, read_table, write_table
+
+    id_map = {}
+    evaluation_decisions = []
+    for row in read_table(evaluation / "decisions.parquet"):
+        new_id = f"evaluation-{row['decision_id']}"
+        id_map[row["decision_id"]] = new_id
+        evaluation_decisions.append(
+            row
+            | {
+                "decision_id": new_id,
+                "game_id": f"evaluation-{row['game_id']}",
+                "player": f"evaluation-{row['player']}",
+                "position": f"evaluation-{row['position']}",
+            }
+        )
+    write_table(evaluation / "decisions.parquet", evaluation_decisions, DECISIONS)
+    evaluation_episodes = []
+    for row in read_table(evaluation / "episodes.parquet"):
+        new_id = id_map[row["decision_id"]]
+        evaluation_episodes.append(
+            row
+            | {
+                "episode_id": new_id,
+                "decision_id": new_id,
+                "game_id": f"evaluation-{row['game_id']}",
+                "player": f"evaluation-{row['player']}",
+                "position": f"evaluation-{row['position']}",
+            }
+        )
+    write_table(evaluation / "episodes.parquet", evaluation_episodes, EPISODES)
+    partitions = json.loads((evaluation / "partitions.json").read_text())
+    atomic_json(
+        evaluation / "partitions.json",
+        {part: [id_map[identifier] for identifier in ids] for part, ids in partitions.items()},
+    )
+    atomic_json(evaluation / "episodes.config.json", config)
+    atomic_json(evaluation / "embedding-model.json", model)
+    atomic_json(evaluation / "descriptions.json", {"records": []})
+    atomic_json(
+        evaluation / "stability.json",
+        {"config": {"stable_gate": {"version": 1}}, "screened": 0, "decisions": []},
+    )
+    atomic_json(
+        evaluation / "episodes.complete.json",
+        {
+            "episodes_sha256": digest(evaluation / "episodes.parquet"),
+            "stability_sha256": digest(evaluation / "stability.json"),
+            "config_sha256": hashlib.sha256(
+                json.dumps(config, sort_keys=True).encode()
+            ).hexdigest(),
+        },
+    )
+    evaluation_descriptions_complete = {
+        "descriptions_sha256": digest(evaluation / "descriptions.json"),
+        "episodes_sha256": digest(evaluation / "episodes.parquet"),
+        "episodes_config_sha256": digest(evaluation / "episodes.config.json"),
+        "embedding_model_sha256": digest(evaluation / "embedding-model.json"),
+    }
+    atomic_json(evaluation / "descriptions.complete.json", evaluation_descriptions_complete)
+    evaluation_marker = evaluation_descriptions_complete | {"episodes_sha256": "tampered"}
+    atomic_json(evaluation / "descriptions.complete.json", evaluation_marker)
+    from chess_research.trajectories import measure
+
+    with pytest.raises(ValueError, match="Stable semantic completion hash mismatch"):
+        measure(evaluation, bootstrap=2, taxonomy_run=run)
+    atomic_json(evaluation / "descriptions.complete.json", evaluation_descriptions_complete)
+    assert (measure(evaluation, bootstrap=2, taxonomy_run=run)).exists()
+
+
 def test_freeze_requires_source_evidence_and_explicit_selection_partition(tmp_path):
     import json
 

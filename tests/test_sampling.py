@@ -34,6 +34,10 @@ def test_partition_quota_rounding_sums_to_requested_count():
         quotas = _stratum_quotas(count, [600])
         assert quotas == {600: partition_counts}
         assert sum(quotas[600].values()) == count
+    evaluation_only = _stratum_quotas(2000, [400, 600, 800, 1000], "evaluation")
+    assert evaluation_only == {
+        band: {"discovery": 0, "selection": 0, "evaluation": 500} for band in (400, 600, 800, 1000)
+    }
 
 
 def _game(game_id: str, black: str, white_move: chess.Move) -> tuple[str, dict]:
@@ -141,6 +145,69 @@ def test_stratified_sampler_reserves_late_fresh_evaluation_quota(tmp_path):
     assert len({row["position"] for row in rows}) == len(rows)
     assert all(count <= 10 for count in Counter(row["player"] for row in rows).values())
     assert all(chess.Move.from_uci(row["move"]) in replay(row).legal_moves for row in rows)
+
+
+def test_evaluation_only_sampler_fills_four_rating_bands(tmp_path):
+    seed = 1024
+    targets = _players(seed, "evaluation", 2000)
+    opponents = _players(seed, "discovery", 2000)
+    blocks = []
+    bands = (400, 600, 800, 1000)
+    for index, (target, opponent) in enumerate(zip(targets, opponents, strict=True)):
+        rating = bands[index // 500]
+        game = chess.pgn.Game()
+        game.headers.update(
+            {
+                "Event": "Rated rapid game",
+                "Site": f"https://lichess.org/eval-only-{index}",
+                "White": opponent,
+                "Black": target,
+                "WhiteElo": str(rating),
+                "BlackElo": str(rating),
+                "Result": "*",
+            }
+        )
+        node = game.add_variation(chess.Move.from_uci("e2e4"))
+        node.add_variation(chess.Move.from_uci("e7e5"))
+        blocks.append(str(game))
+    archive = tmp_path / "evaluation-games.pgn"
+    archive.write_text("\n\n".join(blocks) + "\n")
+
+    run = tmp_path / "evaluation-run"
+    sample(
+        archive,
+        run,
+        count=2000,
+        seed=seed,
+        rating_min=400,
+        rating_max=1199,
+        stratified=True,
+        only_partition="evaluation",
+    )
+
+    rows = read_table(run / "decisions.parquet")
+    config = json.loads((run / "config.json").read_text())
+    assert len(rows) == 2000
+    assert {partition(row["player"], seed) for row in rows} == {"evaluation"}
+    assert Counter(row["rating"] // 200 * 200 for row in rows) == {
+        400: 500,
+        600: 500,
+        800: 500,
+        1000: 500,
+    }
+    assert config["only_partition"] == "evaluation"
+    assert config["partition_band_quotas"] == {
+        str(band): {"discovery": 0, "selection": 0, "evaluation": 500} for band in bands
+    }
+
+
+def test_sampler_rejects_unknown_only_partition(tmp_path):
+    import pytest
+
+    archive = tmp_path / "unused.pgn"
+    archive.write_text("")
+    with pytest.raises(ValueError, match="only_partition"):
+        sample(archive, tmp_path / "run", count=1, seed=1, only_partition="all")
 
 
 def test_legacy_non_stratified_sampling_has_no_partition_quota(tmp_path):

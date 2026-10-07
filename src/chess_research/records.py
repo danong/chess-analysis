@@ -4,7 +4,7 @@ import json
 import os
 from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -33,6 +33,10 @@ class Analysis(TypedDict):
     loss: float
     before_pv: list[str]
     after_pv: list[str]
+    before_depth: NotRequired[int | None]
+    after_depth: NotRequired[int | None]
+    before_bound: NotRequired[str | None]
+    after_bound: NotRequired[str | None]
 
 
 DECISIONS = pa.schema(
@@ -60,6 +64,10 @@ ANALYSES = pa.schema(
         ("loss", pa.float64()),
         ("before_pv", pa.list_(pa.string())),
         ("after_pv", pa.list_(pa.string())),
+        ("before_depth", pa.int32()),
+        ("after_depth", pa.int32()),
+        ("before_bound", pa.string()),
+        ("after_bound", pa.string()),
     ]
 )
 
